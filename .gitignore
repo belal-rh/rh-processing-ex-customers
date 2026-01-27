@@ -1,0 +1,6 @@
+.env
+.venv/
+/output/
+/cleaning_scripts/
+__pycache__/
+.DS_Store
