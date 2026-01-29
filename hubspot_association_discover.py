@@ -6,7 +6,8 @@ import sys
 import json
 import requests
 from typing import Any
-
+from dotenv import load_dotenv  
+load_dotenv()
 
 def _get_env(name: str) -> str:
     v = os.getenv(name, "").strip()

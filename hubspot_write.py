@@ -1,10 +1,8 @@
 # hubspot_write.py
 from __future__ import annotations
 
-import json
-import os
 import time
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 
@@ -12,11 +10,21 @@ from config import HubSpotConfig
 from rate_limit import TokenBucketLimiter, RateLimitConfig, compute_backoff
 
 
+HUBSPOT_DEFINED = "HUBSPOT_DEFINED"
+
+
 class HubSpotWriteClient:
+    """
+    Write client for HubSpot CRM.
+    Preferred strategy:
+      - Create Note (v3) AND associate to Contact (+ Deals) in a single POST request.
+        This avoids association v4 edge cases / 404s.
+    """
+
     def __init__(self, cfg: HubSpotConfig, note_to_contact_type_id: int, note_to_deal_type_id: int):
         self.cfg = cfg
-        self.note_to_contact_type_id = note_to_contact_type_id
-        self.note_to_deal_type_id = note_to_deal_type_id
+        self.note_to_contact_type_id = int(note_to_contact_type_id)
+        self.note_to_deal_type_id = int(note_to_deal_type_id)
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -26,10 +34,10 @@ class HubSpotWriteClient:
             }
         )
 
-        # conservative default; you can tune per cfg later
+        # Keep conservative; HubSpot can rate limit quickly in bursts
         self.limiter = TokenBucketLimiter(RateLimitConfig(rate=2.0, burst=2))
 
-    def _request(self, method: str, path: str, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(self, method: str, path: str, json_body: dict[str, Any] | list[Any] | None = None) -> dict[str, Any]:
         url = f"{self.cfg.api_base}{path}"
         last_err: Exception | None = None
 
@@ -49,7 +57,10 @@ class HubSpotWriteClient:
                         time.sleep(compute_backoff(attempt, base=self.cfg.backoff_base_seconds, max_s=30.0))
                     continue
 
-                resp.raise_for_status()
+                # helpful error content
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"HubSpot Client Error {resp.status_code}: {resp.text}")
+
                 return resp.json() if resp.text else {}
 
             except Exception as e:
@@ -58,11 +69,22 @@ class HubSpotWriteClient:
 
         raise RuntimeError(f"HubSpot write failed: {method} {path}. Last error: {last_err}")
 
+    # -------------------------
+    # Legacy methods (keep)
+    # -------------------------
+
     def create_note_html(self, html_body: str, timestamp_ms: int | None = None) -> str:
-        # hs_note_body supports HTML
-        props = {"hs_note_body": html_body}
+        """
+        Legacy: creates a note only. (No associations)
+        NOTE: In many portals hs_timestamp is required.
+        """
+        props: dict[str, Any] = {"hs_note_body": html_body}
+
         if timestamp_ms is not None:
             props["hs_timestamp"] = str(timestamp_ms)
+        else:
+            # safest: set NOW in ms if caller didn't provide
+            props["hs_timestamp"] = str(int(time.time() * 1000))
 
         data = self._request("POST", "/crm/v3/objects/notes", json_body={"properties": props})
         note_id = str(data.get("id", "") or "")
@@ -71,24 +93,133 @@ class HubSpotWriteClient:
         return note_id
 
     def associate_note_to_contact(self, note_id: str, contact_id: str) -> None:
-        # v4 association create
         self._request(
             "PUT",
             f"/crm/v4/objects/notes/{note_id}/associations/contacts/{contact_id}/{self.note_to_contact_type_id}",
-            json_body=None,
+            json_body=[{"associationCategory": HUBSPOT_DEFINED, "associationTypeId": self.note_to_contact_type_id}],
         )
 
     def associate_note_to_deal(self, note_id: str, deal_id: str) -> None:
         self._request(
             "PUT",
             f"/crm/v4/objects/notes/{note_id}/associations/deals/{deal_id}/{self.note_to_deal_type_id}",
-            json_body=None,
+            json_body=[{"associationCategory": HUBSPOT_DEFINED, "associationTypeId": self.note_to_deal_type_id}],
         )
 
+    # -------------------------
+    # Preferred method (NEW)
+    # -------------------------
 
-# -------------------------------------------------------------------
-# NEW: UI helper - push verified HTML note to HubSpot for ONE contact
-# -------------------------------------------------------------------
+    def create_note_html_with_associations(
+        self,
+        html_body: str,
+        contact_id: str,
+        deal_ids: Iterable[str] | None = None,
+        timestamp_iso_utc: str | None = None,
+        timestamp_ms: int | None = None,
+    ) -> str:
+        """
+        Preferred: Create Note and associate to Contact (+ optional Deals) in a single POST.
+
+        hs_timestamp:
+          - If timestamp_iso_utc provided -> used directly (e.g. "2026-01-29T10:45:00Z")
+          - Else if timestamp_ms provided -> used as string
+          - Else -> now() in ms
+        """
+        if not contact_id or not str(contact_id).strip():
+            raise ValueError("contact_id required")
+
+        # hs_timestamp can be ISO string OR ms string
+        if timestamp_iso_utc and timestamp_iso_utc.strip():
+            hs_timestamp_val = timestamp_iso_utc.strip()
+        elif timestamp_ms is not None:
+            hs_timestamp_val = str(int(timestamp_ms))
+        else:
+            hs_timestamp_val = str(int(time.time() * 1000))
+
+        associations: list[dict[str, Any]] = [
+            {
+                "to": {"id": str(contact_id)},
+                "types": [
+                    {
+                        "associationCategory": HUBSPOT_DEFINED,
+                        "associationTypeId": self.note_to_contact_type_id,
+                    }
+                ],
+            }
+        ]
+
+        if deal_ids:
+            for did in deal_ids:
+                did = (str(did) or "").strip()
+                if not did:
+                    continue
+                associations.append(
+                    {
+                        "to": {"id": did},
+                        "types": [
+                            {
+                                "associationCategory": HUBSPOT_DEFINED,
+                                "associationTypeId": self.note_to_deal_type_id,
+                            }
+                        ],
+                    }
+                )
+
+        payload = {
+            "properties": {
+                "hs_timestamp": hs_timestamp_val,
+                "hs_note_body": html_body,
+            },
+            "associations": associations,
+        }
+
+        data = self._request("POST", "/crm/v3/objects/notes", json_body=payload)
+        note_id = str(data.get("id", "") or "")
+        if not note_id:
+            raise RuntimeError(f"Failed to create note with associations: missing id. resp={data}")
+        return note_id
+
+    # Convenience helper for pipeline usage
+    def push_verified_note_to_hubspot(
+        self,
+        contact_id: str,
+        html_note: str,
+        deal_ids: list[str] | None = None,
+        timestamp_ms: int | None = None,
+        timestamp_iso_utc: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Returns a structured result for logging/CSV:
+          { ok, contact_id, note_id, deal_ids, error }
+        """
+        try:
+            note_id = self.create_note_html_with_associations(
+                html_body=html_note,
+                contact_id=contact_id,
+                deal_ids=deal_ids or [],
+                timestamp_ms=timestamp_ms,
+                timestamp_iso_utc=timestamp_iso_utc,
+            )
+            return {
+                "ok": True,
+                "contact_id": str(contact_id),
+                "note_id": str(note_id),
+                "deal_ids": [str(d) for d in (deal_ids or [])],
+                "error": "",
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "contact_id": str(contact_id),
+                "note_id": "",
+                "deal_ids": [str(d) for d in (deal_ids or [])],
+                "error": str(e),
+            }
+
+# ... (dein bestehender Code der Klasse HubSpotWriteClient) ...
+
+# Füge dies AM ENDE von hubspot_write.py hinzu:
 
 def push_verified_note_to_hubspot(
     contact_dir: str,
@@ -97,152 +228,93 @@ def push_verified_note_to_hubspot(
     timestamp_ms: int | None = None,
 ) -> dict[str, Any]:
     """
-    Pushes the locally rendered HTML note to HubSpot and stores results to disk.
-
-    Expected files in contact_dir:
-      - meta.json (must contain hubspot_contact_id)
-      - verified.json (must have {"verified": true})
-      - step4_note.html (HTML body)
-
-    Optional:
-      - step2_hubspot.json (to discover deal_ids; preferred)
-      - hubspot_deals.json (alternative)
-
-    Writes:
-      - hubspot_write_result.json on success
-      - hubspot_write_error.json on failure
-
-    Returns a dict with result details.
+    Standalone UI Helper: Liest Daten aus contact_dir und nutzt HubSpotWriteClient.
     """
     contact_dir = os.path.abspath(contact_dir)
 
-    def read_json(path: str) -> dict[str, Any]:
-        if not os.path.exists(path):
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            return obj if isinstance(obj, dict) else {}
-        except Exception:
-            return {}
+    # 1. Daten lesen
+    def _read_json(path):
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f: return json.load(f)
+        return {}
 
-    def read_text(path: str) -> str:
-        if not os.path.exists(path):
-            return ""
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception:
-            return ""
+    def _read_text(path):
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f: return f.read()
+        return ""
 
-    def write_json(path: str, obj: Any) -> None:
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    def _write_json(path, obj):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
 
-    meta = read_json(os.path.join(contact_dir, "meta.json"))
-    verified = read_json(os.path.join(contact_dir, "verified.json"))
-    html_note = read_text(os.path.join(contact_dir, "step4_note.html")).strip()
+    meta = _read_json(os.path.join(contact_dir, "meta.json"))
+    verified = _read_json(os.path.join(contact_dir, "verified.json"))
+    html_note = _read_text(os.path.join(contact_dir, "step4_note.html")).strip()
 
     contact_id = str(meta.get("hubspot_contact_id") or meta.get("contact_id") or "").strip()
     email = str(meta.get("email") or "").strip()
 
+    # 2. Validierung
+    error_res = None
     if not contact_id:
-        res = {"ok": False, "error": "missing_hubspot_contact_id", "contact_id": "", "email": email}
-        write_json(os.path.join(contact_dir, "hubspot_write_error.json"), res)
-        return res
+        error_res = {"error": "missing_hubspot_contact_id"}
+    elif not verified.get("verified"):
+        error_res = {"error": "not_verified"}
+    elif not html_note:
+        error_res = {"error": "missing_step4_note_html"}
 
-    if not bool(verified.get("verified", False)):
-        res = {"ok": False, "error": "not_verified", "contact_id": contact_id, "email": email}
-        write_json(os.path.join(contact_dir, "hubspot_write_error.json"), res)
-        return res
+    if error_res:
+        error_res.update({"ok": False, "contact_id": contact_id, "email": email})
+        _write_json(os.path.join(contact_dir, "hubspot_write_error.json"), error_res)
+        return error_res
 
-    if not html_note:
-        res = {"ok": False, "error": "missing_step4_note_html", "contact_id": contact_id, "email": email}
-        write_json(os.path.join(contact_dir, "hubspot_write_error.json"), res)
-        return res
+    # 3. Config laden & Client init
+    from config import load_config
+    _app, _trello, hs_cfg, _oa = load_config()
 
-    # Load config + association type ids
-    # NOTE: These IDs should exist already in your config / discovery logic.
-    from config import load_config  # local import to avoid cycles
-
-    _app_cfg, _trello_cfg, hs_cfg, _oa_cfg = load_config()
-
-    # These should be placed in config.py (constants), but we keep it minimal here:
-    note_to_contact_type_id = getattr(hs_cfg, "note_to_contact_type_id", None)
-    note_to_deal_type_id = getattr(hs_cfg, "note_to_deal_type_id", None)
-
-    if not isinstance(note_to_contact_type_id, int) or not isinstance(note_to_deal_type_id, int):
-        res = {
-            "ok": False,
-            "error": "missing_association_type_ids_in_hubspot_config",
-            "contact_id": contact_id,
-            "email": email,
-            "hint": "Set hs_cfg.note_to_contact_type_id and hs_cfg.note_to_deal_type_id (int).",
-        }
-        write_json(os.path.join(contact_dir, "hubspot_write_error.json"), res)
-        return res
-
-    # Deal discovery (best-effort)
-    deal_ids: list[str] = []
-    if also_associate_deals:
-        # preferred: step2_hubspot.json has discovered deal ids
-        step2 = read_json(os.path.join(contact_dir, "step2_hubspot.json"))
-        # Try common shapes: {"deal_ids":[...]} or {"deals":[{"id":...},...]}
-        if isinstance(step2.get("deal_ids"), list):
-            deal_ids = [str(x).strip() for x in step2.get("deal_ids") if str(x).strip()]
-        elif isinstance(step2.get("deals"), list):
-            tmp = []
-            for d in step2.get("deals"):
-                if isinstance(d, dict) and d.get("id"):
-                    tmp.append(str(d["id"]).strip())
-            deal_ids = tmp
-
-        # alternative: hubspot_deals.json
-        if not deal_ids:
-            deals_alt = read_json(os.path.join(contact_dir, "hubspot_deals.json"))
-            if isinstance(deals_alt.get("deal_ids"), list):
-                deal_ids = [str(x).strip() for x in deals_alt.get("deal_ids") if str(x).strip()]
+    # IDs aus Config oder Env Fallback
+    note_to_contact = getattr(hs_cfg, "note_to_contact_type_id", 0)
+    note_to_deal = getattr(hs_cfg, "note_to_deal_type_id", 0)
 
     client = HubSpotWriteClient(
-        hs_cfg,
-        note_to_contact_type_id=note_to_contact_type_id,
-        note_to_deal_type_id=note_to_deal_type_id,
+        hs_cfg, 
+        note_to_contact_type_id=note_to_contact, 
+        note_to_deal_type_id=note_to_deal
     )
 
+    # 4. Deal IDs sammeln
+    deal_ids = []
+    if also_associate_deals:
+        step2 = _read_json(os.path.join(contact_dir, "step2_hubspot.json"))
+        # Versuche verschiedene Formate zu parsen
+        if isinstance(step2.get("deal_ids"), list):
+            deal_ids = step2["deal_ids"]
+        elif isinstance(step2.get("deals"), list):
+             # Falls Format: deals: [{id: 123}, ...]
+            deal_ids = [str(d.get("id")) for d in step2["deals"] if d.get("id")]
+    
+    # Filtern leerer IDs
+    deal_ids = [str(d).strip() for d in deal_ids if str(d).strip()]
+
+    # 5. Ausführen über neue Methode
     try:
-        note_id = client.create_note_html(html_note, timestamp_ms=timestamp_ms)
-        client.associate_note_to_contact(note_id, contact_id)
-
-        assoc_errors: list[dict[str, Any]] = []
-        if also_associate_deals and deal_ids:
-            for did in deal_ids:
-                try:
-                    client.associate_note_to_deal(note_id, did)
-                except Exception as e:
-                    assoc_errors.append({"deal_id": did, "error": str(e)})
-
-        res = {
-            "ok": True,
-            "ts": int(time.time()),
-            "contact_id": contact_id,
-            "email": email,
-            "note_id": note_id,
-            "deal_ids": deal_ids,
-            "deal_assoc_errors": assoc_errors,
-        }
-        write_json(os.path.join(contact_dir, "hubspot_write_result.json"), res)
+        # Hier nutzen wir deine NEUE Methode
+        res = client.push_verified_note_to_hubspot(
+            contact_id=contact_id,
+            html_note=html_note,
+            deal_ids=deal_ids,
+            timestamp_ms=timestamp_ms
+        )
+        
+        # Ergebnis speichern
+        if res["ok"]:
+            _write_json(os.path.join(contact_dir, "hubspot_write_result.json"), res)
+        else:
+            _write_json(os.path.join(contact_dir, "hubspot_write_error.json"), res)
+            
         return res
 
     except Exception as e:
-        res = {
-            "ok": False,
-            "ts": int(time.time()),
-            "contact_id": contact_id,
-            "email": email,
-            "error": str(e),
-        }
-        write_json(os.path.join(contact_dir, "hubspot_write_error.json"), res)
-        return res
+        final_err = {"ok": False, "error": str(e), "contact_id": contact_id}
+        _write_json(os.path.join(contact_dir, "hubspot_write_error.json"), final_err)
+        return final_err

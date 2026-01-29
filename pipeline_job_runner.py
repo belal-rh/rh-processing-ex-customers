@@ -578,12 +578,15 @@ def push_verified_to_hubspot(
 ) -> dict[str, Any]:
     """
     For each verified contact:
-      - create note (HTML)
-      - associate note -> contact
-      - if also_associate_deals: associate note -> each deal of contact (reads deal_ids from step2_hubspot.json)
+      - create note (HTML) AND associate to contact/deals
     """
     job_dir = JOB_STORE.job_dir(job_id)
-    writer = HubSpotWriteClient(hs_cfg)
+    
+    # Config Werte sicherstellen
+    n_c_id = getattr(hs_cfg, "note_to_contact_type_id", 0)
+    n_d_id = getattr(hs_cfg, "note_to_deal_type_id", 0)
+    
+    writer = HubSpotWriteClient(hs_cfg, note_to_contact_type_id=n_c_id, note_to_deal_type_id=n_d_id)
 
     snapshot = JOB_STORE.get_snapshot(job_id)
     contacts = snapshot.get("contacts", {})
@@ -612,16 +615,21 @@ def push_verified_to_hubspot(
             if also_associate_deals and os.path.exists(hs_path):
                 with open(hs_path, "r", encoding="utf-8") as f:
                     hs_bundle = json.load(f)
-                deal_ids = [str(x) for x in (hs_bundle.get("deal_ids") or []) if str(x).strip()]
+                # Flexible Deals Erkennung
+                if isinstance(hs_bundle.get("deal_ids"), list):
+                    deal_ids = [str(x) for x in hs_bundle.get("deal_ids") if str(x).strip()]
+                elif isinstance(hs_bundle.get("deals"), list): # Fallback falls du Struktur änderst
+                     deal_ids = [str(d["id"]) for d in hs_bundle["deals"] if d.get("id")]
 
             JOB_STORE.update_contact(job_id, contact_id, step="write", last_message="Schreibe Note nach HubSpot…")
 
-            note_id = writer.create_note_html(html)
-            writer.associate_note_to_contact(note_id, contact_id)
-
-            if also_associate_deals and deal_ids:
-                for did in deal_ids:
-                    writer.associate_note_to_deal(note_id, did)
+            # --- NEUER AUFRUF ---
+            # Alles in einem Request
+            note_id = writer.create_note_html_with_associations(
+                html_body=html,
+                contact_id=contact_id,
+                deal_ids=deal_ids
+            )
 
             write_json(os.path.join(cdir, "hubspot_write_result.json"), {
                 "note_id": note_id,
